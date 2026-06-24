@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Asset Barcode Scanner</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0; padding: 16px; background: #f4f5f7; color: #1a1a2e; }
+    .card { max-width: 480px; margin: 0 auto; background: #fff; border-radius: 12px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .sub { font-size: 13px; color: #6b7280; margin: 0 0 18px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+    input[type="text"] { width: 100%; padding: 12px; font-size: 16px; border: 1px solid #d1d5db;
+      border-radius: 8px; margin-bottom: 16px; }
+    input.filled { border-color: #16a34a; background: #f0fdf4; }
+    button { width: 100%; padding: 13px; font-size: 15px; font-weight: 600; border: none;
+      border-radius: 8px; cursor: pointer; margin-top: 10px; }
+    .btn-primary { background: #4b1d8f; color: #fff; margin-top: 0; }
+    .btn-secondary { background: #e5e7eb; color: #1a1a2e; }
+    .viewport { position: relative; margin: 16px 0; border-radius: 8px; overflow: hidden;
+      background: #000; display: none; }
+    .viewport.active { display: block; }
+    video { width: 100%; display: block; }
+    .scanbox { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      width: 80%; height: 35%; border: 3px solid rgba(255,255,255,0.9); border-radius: 6px; }
+    .status { font-size: 13px; text-align: center; margin-top: 12px; min-height: 18px; }
+    .status.ok { color: #16a34a; font-weight: 600; }
+    .status.err { color: #dc2626; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Add Asset</h1>
+    <p class="sub">Scan the barcode on the asset label to capture its serial number.</p>
+
+    <label for="serial">Asset Serial Number</label>
+    <input type="text" id="serial" placeholder="e.g. ALF010LP" />
+
+    <button class="btn-primary" id="startBtn">📷 Scan Barcode</button>
+    <button class="btn-secondary hidden" id="stopBtn">Stop Scanning</button>
+    <button class="btn-secondary" id="photoBtn">🖼️ Scan from a photo instead</button>
+    <input type="file" accept="image/*" id="fileInput" class="hidden" />
+
+    <div class="viewport" id="viewport">
+      <video id="video" playsinline muted></video>
+      <div class="scanbox"></div>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <!-- Plain script: buttons are wired immediately, so they always respond.
+       The decoding engine (zxing-wasm) is loaded on demand via dynamic import,
+       wrapped in try/catch so any load failure shows a message instead of
+       silently breaking the page. -->
+  <script>
+    const VERSION = "3.1.0";
+    const ENGINE_URL = "https://cdn.jsdelivr.net/npm/zxing-wasm@" + VERSION + "/dist/es/reader/index.js";
+    const WASM_DIR   = "https://cdn.jsdelivr.net/npm/zxing-wasm@" + VERSION + "/dist/reader/";
+
+    const serialInput = document.getElementById("serial");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn  = document.getElementById("stopBtn");
+    const photoBtn = document.getElementById("photoBtn");
+    const fileInput = document.getElementById("fileInput");
+    const statusEl = document.getElementById("status");
+    const viewport = document.getElementById("viewport");
+    const video = document.getElementById("video");
+
+    const READ_OPTS = {
+      tryHarder: true,
+      formats: ["Code128","Code39","Code93","Codabar","ITF","EAN-13","EAN-8","UPC-A","UPC-E"],
+      maxNumberOfSymbols: 1
+    };
+
+    let engine = null;          // cached zxing-wasm module
+    let stream = null;
+    let scanning = false;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (kind ? " " + kind : "");
+    }
+
+    // Load the WASM engine once, with clear error reporting.
+    async function getEngine() {
+      if (engine) return engine;
+      setStatus("Loading scanner engine…");
+      try {
+        const mod = await import(ENGINE_URL);
+        mod.setZXingModuleOverrides({
+          locateFile: (path, prefix) =>
+            path.endsWith(".wasm") ? WASM_DIR + path : prefix + path
+        });
+        engine = mod;
+        return engine;
+      } catch (e) {
+        setStatus("Couldn't load the scanner engine. The page must be served over HTTPS (not opened as a file). Details: " + e, "err");
+        throw e;
+      }
+    }
+
+    // ---- Your integration point ----
+    function onScanSuccess(text) {
+      serialInput.value = text;
+      serialInput.classList.add("filled");
+      setStatus("✓ Captured: " + text, "ok");
+      stopScanner();
+    }
+
+    async function startScanner() {
+      let mod;
+      try { mod = await getEngine(); } catch { return; }
+
+      startBtn.classList.add("hidden");
+      stopBtn.classList.remove("hidden");
+      setStatus("Point the camera at the barcode…");
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        viewport.classList.add("active");
+        scanning = true;
+        scanLoop(mod);
+      } catch (err) {
+        let msg;
+        if (err && (err.name === "NotAllowedError" || String(err).includes("Permission denied")))
+          msg = "Camera blocked. Tap the lock icon by the address bar → Permissions → set Camera to Allow, then reload.";
+        else if (err && err.name === "NotFoundError") msg = "No camera found on this device.";
+        else if (err && err.name === "NotReadableError") msg = "Camera is in use by another app.";
+        else msg = "Could not start the camera: " + err;
+        setStatus(msg, "err");
+        resetButtons();
+      }
+    }
+
+    async function scanLoop(mod) {
+      if (!scanning) return;
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        try {
+          const results = await mod.readBarcodes(imageData, READ_OPTS);
+          if (results.length && results[0].text) { onScanSuccess(results[0].text); return; }
+        } catch (e) { /* keep scanning */ }
+      }
+      setTimeout(() => requestAnimationFrame(() => scanLoop(mod)), 120);
+    }
+
+    function stopScanner() {
+      scanning = false;
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      video.srcObject = null;
+      viewport.classList.remove("active");
+      resetButtons();
+    }
+
+    function resetButtons() {
+      startBtn.classList.remove("hidden");
+      stopBtn.classList.add("hidden");
+    }
+
+    async function scanFromPhoto(file) {
+      stopScanner();
+      let mod;
+      try { mod = await getEngine(); } catch { return; }
+      setStatus("Reading the photo…");
+      try {
+        const results = await mod.readBarcodes(file, READ_OPTS);
+        if (results.length && results[0].text) onScanSuccess(results[0].text);
+        else setStatus("No readable barcode found in that photo.", "err");
+      } catch (e) {
+        setStatus("Could not read that photo: " + e, "err");
+      }
+    }
+
+    // Buttons wired right away — independent of the engine load.
+    startBtn.addEventListener("click", startScanner);
+    stopBtn.addEventListener("click", stopScanner);
+    photoBtn.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", (e) => {
+      if (e.target.files && e.target.files.length) scanFromPhoto(e.target.files[0]);
+      e.target.value = "";
+    });
+  </script>
+</body>
+</html>
